@@ -8,6 +8,7 @@ use super::{
         binary_search_descending_or_greater, binary_search_descending_or_smaller,
         binary_search_or_greater, binary_search_or_smaller,
     },
+    lookup_index::Equality,
     util::{compare_values, from_wildcard_to_regex, result_matches_regex},
 };
 
@@ -115,6 +116,16 @@ fn linear_search(
         }
     }
     None
+}
+
+/// The rule an exact search compares with, `None` for the approximate modes.
+fn exact_equality(match_mode: &MatchMode, target: &CalcResult) -> Option<Equality> {
+    match (match_mode, target) {
+        (MatchMode::ExactMatch, _) => Some(Equality::Compare),
+        (MatchMode::WildcardMatch, CalcResult::String(_)) => Some(Equality::Text),
+        (MatchMode::WildcardMatch, _) => Some(Equality::Compare),
+        (MatchMode::ExactMatchSmaller | MatchMode::ExactMatchLarger, _) => None,
+    }
 }
 
 impl<'a> Model<'a> {
@@ -269,8 +280,22 @@ impl<'a> Model<'a> {
                         };
                         match search_mode {
                             SearchMode::StartAtFirstItem | SearchMode::StartAtLastItem => {
-                                let array = &self.prepare_array(&left, &right, is_row_vector);
-                                match linear_search(&lookup_value, array, search_mode, match_mode) {
+                                let from_last = search_mode == SearchMode::StartAtLastItem;
+                                let indexed = exact_equality(&match_mode, &lookup_value).and_then(
+                                    |equality| {
+                                        self.find_with_index(left, right, &lookup_value, equality)
+                                    },
+                                );
+                                let found = match indexed {
+                                    Some(found) => found
+                                        .map(|(first, last)| if from_last { last } else { first }),
+                                    None => {
+                                        let array =
+                                            &self.prepare_array(&left, &right, is_row_vector);
+                                        linear_search(&lookup_value, array, search_mode, match_mode)
+                                    }
+                                };
+                                match found {
                                     Some(index) => {
                                         let row_index =
                                             if is_row_vector { index as i32 } else { 0 };

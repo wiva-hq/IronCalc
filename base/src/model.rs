@@ -37,7 +37,7 @@ use crate::{
     utils as common,
 };
 
-use crate::evaluation::{CellKey, Evaluation, FormulaCell, Seen};
+use crate::evaluation::{CellKey, Evaluation, FormulaCell, Recalc, Seen};
 use crate::{cf_types::CfCellResult, tz::Tz};
 
 #[cfg(any(test, feature = "mock_time"))]
@@ -231,6 +231,9 @@ pub struct Model<'a> {
     /// (`parse_formulas`), extended when a formula is added. See
     /// `shared_formula_index`.
     pub(crate) shared_formula_lookup: Vec<SharedFormulaLookup>,
+    /// What the last evaluation leaves for the next one to evaluate only what
+    /// changed. `None` makes the next evaluation evaluate everything.
+    pub(crate) recalc: Option<Recalc>,
 }
 
 /// Formula text to index in `Worksheet::shared_formulas`, for one sheet.
@@ -1862,6 +1865,7 @@ impl<'a> Model<'a> {
             evaluation: Evaluation::default(),
             cf_cache: HashMap::new(),
             links: HashMap::new(),
+            recalc: None,
         };
 
         model.parse_formulas();
@@ -2923,7 +2927,7 @@ impl<'a> Model<'a> {
     }
 
     // Helper function that returns a defined name given the name and scope
-    fn get_parsed_defined_name(
+    pub(crate) fn get_parsed_defined_name(
         &self,
         name: &str,
         scope: Option<u32>,
@@ -3860,6 +3864,8 @@ impl<'a> Model<'a> {
 
     /// Sets the locale of the model
     pub fn set_locale(&mut self, locale_id: &str) -> Result<(), String> {
+        // Values depend on these: the next evaluation evaluates all.
+        self.forget_dependencies();
         let locale = match get_locale(locale_id) {
             Ok(l) => l,
             Err(_) => return Err(format!("Invalid locale: {locale_id}")),
@@ -3873,6 +3879,8 @@ impl<'a> Model<'a> {
 
     /// Sets the timezone of the model
     pub fn set_timezone(&mut self, timezone: &str) -> Result<(), String> {
+        // Values depend on these: the next evaluation evaluates all.
+        self.forget_dependencies();
         let tz = match Tz::parse(timezone) {
             Ok(tz) => tz,
             Err(_) => return Err(format!("Invalid timezone: {}", timezone)),
@@ -3885,6 +3893,8 @@ impl<'a> Model<'a> {
 
     /// Sets the language
     pub fn set_language(&mut self, language_id: &str) -> Result<(), String> {
+        // Values depend on these: the next evaluation evaluates all.
+        self.forget_dependencies();
         let language = match get_language(language_id) {
             Ok(l) => l,
             Err(_) => return Err(format!("Invalid language: {language_id}")),

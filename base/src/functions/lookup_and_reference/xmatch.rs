@@ -13,6 +13,7 @@ use crate::functions::{
         binary_search_descending_or_greater, binary_search_descending_or_smaller,
         binary_search_or_greater, binary_search_or_smaller,
     },
+    lookup_index::Equality,
     util::{compare_values, from_wildcard_to_regex, result_matches_regex},
 };
 
@@ -133,6 +134,17 @@ fn linear_search(
     }
 }
 
+/// The rule an exact search compares with, `None` for the approximate and
+/// regular expression modes.
+fn exact_equality(match_mode: MatchMode, target: &CalcResult) -> Option<Equality> {
+    match (match_mode, target) {
+        (MatchMode::Exact, _) => Some(Equality::Compare),
+        (MatchMode::Wildcard, CalcResult::String(_)) => Some(Equality::Text),
+        (MatchMode::Wildcard, _) => Some(Equality::Compare),
+        (MatchMode::ExactMatchSmaller | MatchMode::ExactMatchLarger | MatchMode::Regex, _) => None,
+    }
+}
+
 impl<'a> Model<'a> {
     /// `=XMATCH(lookup_value, lookup_array, [match_mode], [search_mode])`
     ///
@@ -232,6 +244,28 @@ impl<'a> Model<'a> {
                     row: row2,
                     column: col2,
                 };
+                let exact = match_mode != MatchMode::Regex
+                    && matches!(
+                        search_mode,
+                        SearchMode::FirstToLast | SearchMode::LastToFirst
+                    );
+                if let Some(equality) = exact_equality(match_mode, &lookup_value).filter(|_| exact)
+                {
+                    if let Some(found) = self.find_with_index(left, right, &lookup_value, equality)
+                    {
+                        return match found {
+                            Some((first, last)) => {
+                                let position = if search_mode == SearchMode::LastToFirst {
+                                    last
+                                } else {
+                                    first
+                                };
+                                CalcResult::Number(position as f64 + 1.0)
+                            }
+                            None => CalcResult::new_error(Error::NA, cell, "Not found".to_string()),
+                        };
+                    }
+                }
                 self.prepare_array(&left, &right, is_col_vec)
             }
             CalcResult::Array(rows) => {

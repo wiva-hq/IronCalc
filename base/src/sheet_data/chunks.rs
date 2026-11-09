@@ -29,6 +29,45 @@ pub struct SheetData {
     chunks: Vec<Option<Box<Chunk>>>,
     /// How many rows exist.
     row_count: usize,
+    /// Where cells were written since the log was last taken. Not saved.
+    #[bitcode(skip)]
+    changes: ChangeLog,
+}
+
+/// The positions written to a sheet, so that an evaluation can recalculate
+/// only what depends on them. Every write is noted, whoever makes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChangeLog {
+    /// `(row, column)` of every cell written, in the order of the writes,
+    /// possibly more than once.
+    pub(crate) cells: Vec<(i32, i32)>,
+    /// Set when whole rows were replaced or more cells were written than the
+    /// log keeps: then where is not known.
+    pub(crate) unknown: bool,
+}
+
+/// The most positions a log keeps. Past this, a full evaluation is cheaper
+/// than following the changes one by one.
+const MAX_LOGGED_CHANGES: usize = 1 << 16;
+
+impl ChangeLog {
+    #[inline]
+    fn note(&mut self, row: i32, column: i32) {
+        if self.unknown {
+            return;
+        }
+        if self.cells.len() >= MAX_LOGGED_CHANGES {
+            self.unknown = true;
+            self.cells = Vec::new();
+            return;
+        }
+        self.cells.push((row, column));
+    }
+
+    fn note_unknown(&mut self) {
+        self.unknown = true;
+        self.cells = Vec::new();
+    }
 }
 
 #[derive(Encode, Decode, Debug, Clone)]
@@ -113,13 +152,15 @@ impl SheetData {
         self.row(row)?.get(column)
     }
 
-    /// The cell at a position, to be changed in place.
+    /// The cell at a position, to be changed in place. Noted as written.
     pub fn cell_mut(&mut self, row: i32, column: i32) -> Option<&mut Cell> {
+        self.changes.note(row, column);
         self.row_mut(row)?.get_mut(column)
     }
 
     /// Puts a cell at a position and returns the one that was there.
     pub fn set_cell(&mut self, row: i32, column: i32, cell: Cell) -> Option<Cell> {
+        self.changes.note(row, column);
         self.row_or_insert(row)?.insert(column, cell)
     }
 
@@ -128,9 +169,15 @@ impl SheetData {
         let row_data = self.row_mut(row)?;
         let cell = row_data.remove(column)?;
         if row_data.is_empty() {
-            self.remove_row(row);
+            self.drop_row(row);
         }
+        self.changes.note(row, column);
         Some(cell)
+    }
+
+    /// The positions written since the log was last taken, and a fresh log.
+    pub(crate) fn take_changes(&mut self) -> ChangeLog {
+        std::mem::take(&mut self.changes)
     }
 
     /// True if the sheet has no rows.
@@ -211,6 +258,11 @@ impl SheetData {
 
     /// Removes every cell of a row, and the row.
     pub fn remove_row(&mut self, row: i32) {
+        self.changes.note_unknown();
+        self.drop_row(row);
+    }
+
+    fn drop_row(&mut self, row: i32) {
         let Some((chunk_index, index)) = locate(row) else {
             return;
         };
@@ -229,6 +281,7 @@ impl SheetData {
     /// Replaces the cells of a row. The row exists afterwards, even with no
     /// cells. If a column is given twice the last one stays.
     pub fn set_row(&mut self, row: i32, cells: impl IntoIterator<Item = (i32, Cell)>) {
+        self.changes.note_unknown();
         let Some(row_data) = self.row_or_insert(row) else {
             return;
         };

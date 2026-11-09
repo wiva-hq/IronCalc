@@ -174,6 +174,7 @@ impl<'a> Model<'a> {
 
     /// Reparses all formulas and defined names
     pub(crate) fn reset_parsed_structures(&mut self) {
+        self.forget_dependencies();
         let defined_names = self.workbook.get_defined_names_with_scope();
         self.parser
             .set_worksheets_and_names(self.workbook.get_worksheet_names(), defined_names);
@@ -668,6 +669,7 @@ impl<'a> Model<'a> {
             evaluation: crate::evaluation::Evaluation::default(),
             cf_cache: HashMap::new(),
             links: HashMap::new(),
+            recalc: None,
         };
         model.parse_formulas();
         model.evaluate_conditional_formatting();

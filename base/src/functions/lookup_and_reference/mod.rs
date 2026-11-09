@@ -8,6 +8,7 @@ use crate::{
 };
 
 use super::binary_search::binary_search_on_array;
+use super::lookup_index::Equality;
 use super::util::{compare_values, from_wildcard_to_regex, result_matches_regex, values_are_equal};
 
 mod address_areas;
@@ -95,6 +96,23 @@ impl LookupTable {
         (0..self.rows())
             .map(|row| self.get(model, row, 0, cell))
             .collect()
+    }
+}
+
+/// The rule an exact lookup compares with: the wildcard search for text,
+/// `otherwise` for anything else.
+fn text_or(otherwise: Equality, target: &CalcResult) -> Equality {
+    match target {
+        CalcResult::String(_) => Equality::Text,
+        _ => otherwise,
+    }
+}
+
+fn not_found(cell: CellReferenceIndex) -> CalcResult {
+    CalcResult::Error {
+        error: Error::NA,
+        origin: cell,
+        message: "Not found".to_string(),
     }
 }
 
@@ -409,6 +427,23 @@ impl<'a> Model<'a> {
             1
         };
         let match_range = self.evaluate_node_in_context(&args[1], cell);
+        if match_type == 0 {
+            if let CalcResult::Range { left, right } = match_range {
+                if left.row == right.row || left.column == right.column {
+                    if let Some(found) = self.find_with_index(
+                        left,
+                        right,
+                        &target,
+                        text_or(Equality::Equal, &target),
+                    ) {
+                        return match found {
+                            Some((position, _)) => CalcResult::Number(position as f64 + 1.0),
+                            None => not_found(cell),
+                        };
+                    }
+                }
+            }
+        }
 
         // MATCH operates on a vector (a single row or single column). We
         // materialize the second argument, be it a range reference or an array
@@ -535,6 +570,28 @@ impl<'a> Model<'a> {
             };
         }
         // We look for `lookup_value` in the first row of the table
+        if !is_sorted {
+            if let LookupTable::Range { left, right } = &table {
+                let (left, last) = (
+                    *left,
+                    CellReferenceIndex {
+                        row: left.row,
+                        ..*right
+                    },
+                );
+                if let Some(found) = self.find_with_index(
+                    left,
+                    last,
+                    &lookup_value,
+                    text_or(Equality::Compare, &lookup_value),
+                ) {
+                    return match found {
+                        Some((column, _)) => table.get(self, row_index - 1, column as i32, cell),
+                        None => not_found(cell),
+                    };
+                }
+            }
+        }
         let search_vector = table.first_row(self, cell);
         match lookup_index(&lookup_value, &search_vector, is_sorted) {
             Some(column) => table.get(self, row_index - 1, column as i32, cell),
@@ -599,6 +656,28 @@ impl<'a> Model<'a> {
             };
         }
         // We look for `lookup_value` in the first column of the table
+        if !is_sorted {
+            if let LookupTable::Range { left, right } = &table {
+                let (left, last) = (
+                    *left,
+                    CellReferenceIndex {
+                        column: left.column,
+                        ..*right
+                    },
+                );
+                if let Some(found) = self.find_with_index(
+                    left,
+                    last,
+                    &lookup_value,
+                    text_or(Equality::Compare, &lookup_value),
+                ) {
+                    return match found {
+                        Some((row, _)) => table.get(self, row as i32, column_index - 1, cell),
+                        None => not_found(cell),
+                    };
+                }
+            }
+        }
         let search_vector = table.first_column(self, cell);
         match lookup_index(&lookup_value, &search_vector, is_sorted) {
             Some(row) => table.get(self, row as i32, column_index - 1, cell),

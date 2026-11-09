@@ -44,10 +44,12 @@ use std::sync::Arc;
 
 use crate::calc_result::CalcResult;
 use crate::constants::{LAST_COLUMN, LAST_ROW};
+use crate::dependencies::{Dependencies, Rect};
 use crate::expressions::token::Error;
 use crate::expressions::types::CellReferenceIndex;
+use crate::functions::lookup_index::LookupIndex;
 use crate::model::Model;
-use crate::types::{ArrayKind, Cell, Worksheet};
+use crate::types::{ArrayKind, Cell, DefinedName, Table, WorkbookSettings, Worksheet};
 
 /// The hasher of the maps the evaluation keeps about positions. Their keys are
 /// three small integers and every formula looks several of them up, which
@@ -421,7 +423,21 @@ pub(crate) struct Evaluation {
     /// restart, the cells stay on `stack`, still `Evaluating`, to be run again
     /// from the top once the recursion has unwound.
     pub(crate) unwinding: bool,
+    /// The formulas the last pass evaluated, when it evaluated only those
+    /// (see `evaluate_changes`). Any other formula holds its value already.
+    /// Kept after the pass, for what is evaluated outside one.
+    pub(crate) partial: Option<HashSet<CellKey, KeyBuild>>,
+    /// The index of every range an exact lookup searched in the current
+    /// pass, by `(sheet, row1, column1, row2, column2)`. `None` for a range
+    /// holding something the index cannot. See `functions::lookup_index`.
+    pub(crate) lookup_indexes: HashMap<LookupKey, Option<Arc<LookupIndex>>, KeyBuild>,
+    /// Makes every lookup search linearly, for tests that compare the two.
+    #[cfg(test)]
+    pub(crate) without_lookup_index: bool,
 }
+
+/// `(sheet, row1, column1, row2, column2)`: a row or column of cells.
+pub(crate) type LookupKey = (u32, i32, i32, i32, i32);
 
 /// How deep the recursion may go when nobody has said otherwise, in formulas
 /// and in bytes of stack. Measured on a chain of `=A2+1`: a formula takes about
@@ -471,6 +487,10 @@ impl Default for Evaluation {
             max_stack: DEFAULT_MAX_STACK,
             stack_base: 0,
             unwinding: false,
+            partial: None,
+            lookup_indexes: HashMap::default(),
+            #[cfg(test)]
+            without_lookup_index: false,
         }
     }
 }
@@ -495,7 +515,69 @@ impl Evaluation {
     }
 }
 
+/// What an evaluation leaves for the next one, so that it evaluates only
+/// what changed: the dependencies of the formulas, and what besides the cells
+/// they depend on.
+pub(crate) struct Recalc {
+    dependencies: Dependencies,
+    shape: Shape,
+    /// Whether the evaluation found a cycle. Which cells of a cycle report it
+    /// depends on the order they are reached in, which only a full evaluation
+    /// gets right: while there is one, every evaluation is full.
+    cycles: bool,
+}
+
+/// What formulas depend on besides cells. When any of it changes, everything
+/// is evaluated.
+#[derive(PartialEq)]
+struct Shape {
+    sheets: Vec<(String, u32)>,
+    defined_names: Vec<DefinedName>,
+    tables: HashMap<String, Table>,
+    settings: WorkbookSettings,
+}
+
+impl Shape {
+    fn of(model: &Model) -> Shape {
+        let workbook = &model.workbook;
+        Shape {
+            sheets: workbook
+                .worksheets
+                .iter()
+                .map(|worksheet| (worksheet.name.clone(), worksheet.sheet_id))
+                .collect(),
+            defined_names: workbook.defined_names.clone(),
+            tables: workbook.tables.clone(),
+            settings: workbook.settings.clone(),
+        }
+    }
+}
+
+/// Following more changed cells than this costs more than evaluating
+/// everything, whatever the size of the workbook.
+const MAX_CHANGES_FOLLOWED: usize = 1 << 14;
+
 impl<'a> Model<'a> {
+    /// Evaluates the workbook.
+    ///
+    /// The first evaluation evaluates every formula. After that only what
+    /// changed is evaluated again: the formulas that read a cell written
+    /// since, directly or through other formulas, and the volatile ones
+    /// (NOW, RAND, INDIRECT, ...). When something else changed, sheets,
+    /// defined names, the locale, rows or columns inserted or deleted, or
+    /// where an array spills, everything is evaluated, as `evaluate_all`
+    /// does. Either way the values are the same.
+    pub fn evaluate(&mut self) {
+        if !self.evaluate_changes() {
+            self.evaluate_all();
+        }
+    }
+
+    /// Makes the next evaluation evaluate every formula.
+    pub(crate) fn forget_dependencies(&mut self) {
+        self.recalc = None;
+    }
+
     /// Evaluates every formula in the workbook.
     ///
     /// Runs passes until one completes without a restart. `RestartLog` learns
@@ -503,7 +585,7 @@ impl<'a> Model<'a> {
     /// circular; see there for why the loop ends. A marked anchor stores
     /// `#CIRC!` and keeps no spill cells: its stale cells are dropped when it
     /// is marked, so there is nothing of it to read or to contradict.
-    pub fn evaluate(&mut self) {
+    pub fn evaluate_all(&mut self) {
         self.sync_anchor_order();
         // Every pass starts from the same sheet: what an abandoned pass wrote
         // is undone. This is what makes a pass a function of the anchor order.
@@ -512,7 +594,7 @@ impl<'a> Model<'a> {
         // anchor's when it is marked.
         let mut spills_before = self.dynamic_spills();
         let mut log = RestartLog::new();
-        while let Some(restart) = self.run_pass(&log.circular) {
+        while let Some(restart) = self.run_pass(&log.circular, None) {
             let marked = log.record(&restart, &mut self.evaluation.anchor_order);
             spills_before.retain(|(position, cell)| {
                 let dropped = match &restart {
@@ -530,7 +612,237 @@ impl<'a> Model<'a> {
             self.restore_dynamic_spills(&spills_before);
         }
         self.evaluation.restarts_in_last_evaluation = log.restarts;
+        self.recalc = Some(Recalc {
+            dependencies: Dependencies::of(self),
+            shape: Shape::of(self),
+            cycles: !self.evaluation.circular.is_empty(),
+        });
         self.evaluate_conditional_formatting();
+        self.forget_changes();
+    }
+
+    /// Evaluates only what changed since the last evaluation (see
+    /// `evaluate`). Returns false when that cannot be done; then everything
+    /// must be evaluated, and what this did is overwritten.
+    fn evaluate_changes(&mut self) -> bool {
+        let Some(mut recalc) = self.recalc.take() else {
+            return false;
+        };
+        if recalc.cycles || recalc.shape != Shape::of(self) {
+            return false;
+        }
+        let Some(changed) = self.take_changes() else {
+            return false;
+        };
+        if changed.len() > MAX_CHANGES_FOLLOWED.max(recalc.dependencies.len() / 4) {
+            return false;
+        }
+        for &position in &changed {
+            let formula = self.formula_cell(position).map(|cell| cell.f);
+            recalc.dependencies.update(self, position, formula);
+            // A link a formula attached goes with it; a formula there now
+            // attaches its own as it runs.
+            self.links.remove(&position);
+        }
+        self.update_anchor_order(&changed);
+        let dirty = self.dirty_formulas(&mut recalc.dependencies, &changed);
+        if !self.run_partial_pass(dirty) {
+            return false;
+        }
+        self.recalc = Some(recalc);
+        self.evaluate_conditional_formatting();
+        self.forget_changes();
+        true
+    }
+
+    /// The positions written since the logs were last taken, sorted and each
+    /// once, and empty logs. `None` if where is not known.
+    fn take_changes(&mut self) -> Option<Vec<CellKey>> {
+        let mut changed = Vec::new();
+        let mut known = true;
+        for (sheet, worksheet) in self.workbook.worksheets.iter_mut().enumerate() {
+            let log = worksheet.sheet_data.take_changes();
+            known &= !log.unknown;
+            changed.extend(
+                log.cells
+                    .into_iter()
+                    .map(|(row, column)| (sheet as u32, row, column)),
+            );
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        known.then_some(changed)
+    }
+
+    /// Empties the logs of written positions: what an evaluation writes is
+    /// its results, not changes to follow.
+    fn forget_changes(&mut self) {
+        for worksheet in &mut self.workbook.worksheets {
+            worksheet.sheet_data.take_changes();
+        }
+    }
+
+    fn formula_cell(&self, (sheet, row, column): CellKey) -> Option<FormulaCell> {
+        self.fetch_cell(CellReferenceIndex { sheet, row, column })
+            .as_deref()
+            .and_then(FormulaCell::of)
+    }
+
+    /// Brings `anchor_order` in line with the dynamic anchors after the cells
+    /// at `changed` were written, as `sync_anchor_order` does: anchors come
+    /// and go only where cells are written, so only there is looked at.
+    fn update_anchor_order(&mut self, changed: &[CellKey]) {
+        let is_anchor = |model: &Self, position: CellKey| {
+            matches!(
+                model.formula_cell(position),
+                Some(FormulaCell {
+                    array: Some((true, _)),
+                    ..
+                })
+            )
+        };
+        let mut order = std::mem::take(&mut self.evaluation.anchor_order);
+        order.retain(|anchor| {
+            changed.binary_search(&key(*anchor)).is_err() || is_anchor(self, key(*anchor))
+        });
+        let known: HashSet<CellKey, KeyBuild> = order.iter().map(|anchor| key(*anchor)).collect();
+        for &position in changed {
+            if !known.contains(&position) && is_anchor(self, position) {
+                let (sheet, row, column) = position;
+                order.push(CellReferenceIndex { sheet, row, column });
+            }
+        }
+        self.evaluation.anchor_order = order;
+    }
+
+    /// The formulas to evaluate after the cells at `changed` (sorted) were
+    /// written: the formulas among them, the volatile ones, the dynamic
+    /// anchors whose spill can change, and every formula that reads one of
+    /// those or a changed cell, directly or not.
+    fn dirty_formulas(
+        &self,
+        dependencies: &mut Dependencies,
+        changed: &[CellKey],
+    ) -> HashSet<CellKey, KeyBuild> {
+        let mut dirty = HashSet::default();
+        let mut todo: Vec<Rect> = changed
+            .iter()
+            .map(|position| Rect::cell(*position))
+            .collect();
+        for &position in changed {
+            if self.formula_cell(position).is_some() {
+                self.mark_dirty(position, &mut dirty, &mut todo);
+            }
+        }
+        let volatile: Vec<CellKey> = dependencies.volatile().copied().collect();
+        for position in volatile {
+            self.mark_dirty(position, &mut dirty, &mut todo);
+        }
+        for anchor in &self.evaluation.anchor_order {
+            // A blocked anchor may spill now, and one whose area was written
+            // to is blocked now.
+            let blocked = matches!(
+                self.stored_value(*anchor),
+                CalcResult::Error {
+                    error: Error::SPILL,
+                    ..
+                }
+            );
+            if blocked
+                || self
+                    .array_area(key(*anchor))
+                    .is_some_and(|area| written(changed, &area))
+            {
+                self.mark_dirty(key(*anchor), &mut dirty, &mut todo);
+            }
+        }
+        dependencies.start_search();
+        let mut readers = Vec::new();
+        while let Some(area) = todo.pop() {
+            dependencies.readers_of(area, &mut |reader| readers.push(reader));
+            for reader in readers.drain(..) {
+                self.mark_dirty(reader, &mut dirty, &mut todo);
+            }
+        }
+        dirty
+    }
+
+    /// Adds a formula to `dirty`; what it writes is to be followed if it is
+    /// new there.
+    fn mark_dirty(
+        &self,
+        position: CellKey,
+        dirty: &mut HashSet<CellKey, KeyBuild>,
+        todo: &mut Vec<Rect>,
+    ) {
+        if !dirty.insert(position) {
+            return;
+        }
+        todo.push(Rect::cell(position));
+        if let Some(area) = self.array_area(position) {
+            todo.push(area);
+        }
+    }
+
+    /// The area an array formula writes now, if it writes more than its cell.
+    fn array_area(&self, position: CellKey) -> Option<Rect> {
+        let (width, height) = self.formula_cell(position)?.array?.1;
+        if width <= 1 && height <= 1 {
+            return None;
+        }
+        let (sheet, row, column) = position;
+        Some(Rect {
+            sheet,
+            row1: row,
+            column1: column,
+            row2: row + height - 1,
+            column2: column + width - 1,
+        })
+    }
+
+    /// Evaluates the `dirty` formulas, the dynamic anchors first, in their
+    /// order, then the rest in natural order. Returns false if the pass found
+    /// a cycle, had to restart, or if an array now spills elsewhere than
+    /// before: what reads the cells it left or took was not evaluated.
+    fn run_partial_pass(&mut self, dirty: HashSet<CellKey, KeyBuild>) -> bool {
+        let anchors: Vec<CellReferenceIndex> = self
+            .evaluation
+            .anchor_order
+            .iter()
+            .filter(|anchor| dirty.contains(&key(**anchor)))
+            .copied()
+            .collect();
+        let spills_before = if anchors.is_empty() {
+            None
+        } else {
+            Some(self.dynamic_spills())
+        };
+        let mut formulas: Vec<CellKey> = dirty.iter().copied().collect();
+        formulas.sort_unstable();
+        let roots = anchors
+            .into_iter()
+            .chain(
+                formulas
+                    .into_iter()
+                    .map(|(sheet, row, column)| CellReferenceIndex { sheet, row, column }),
+            )
+            .collect();
+        let restart = self.run_pass(&[], Some((roots, dirty)));
+        self.evaluation.restarts_in_last_evaluation = restart.is_some() as u32;
+        if !self.evaluation.circular.is_empty() {
+            // A new cycle: see `Recalc::cycles`.
+            return false;
+        }
+        match spills_before {
+            None => restart.is_none(),
+            Some(before) => {
+                if restart.is_some() {
+                    self.restore_dynamic_spills(&before);
+                    return false;
+                }
+                spill_layout(&before) == spill_layout(&self.dynamic_spills())
+            }
+        }
     }
 
     /// Sets how many formulas deep the evaluation may recurse. A formula that
@@ -685,7 +997,14 @@ impl<'a> Model<'a> {
 
     /// One pass over the workbook: anchors first, then every formula. Returns
     /// the reason the pass had to be abandoned, if any.
-    fn run_pass(&mut self, circular_anchors: &[CellKey]) -> Option<Restart> {
+    ///
+    /// With `partial`, the pass evaluates only the formulas of its set,
+    /// starting from its list: any other formula holds its value already.
+    fn run_pass(
+        &mut self,
+        circular_anchors: &[CellKey],
+        partial: Option<(Vec<CellReferenceIndex>, HashSet<CellKey, KeyBuild>)>,
+    ) -> Option<Restart> {
         let state = &mut self.evaluation;
         state.cells.clear();
         state.stack.clear();
@@ -696,15 +1015,26 @@ impl<'a> Model<'a> {
         state.unwinding = false;
         state.circular = circular_anchors.iter().copied().collect();
         state.in_pass = true;
-        // dynamic links (HYPERLINK) are rebuilt on every evaluation
-        self.links.clear();
         self.clear_variable_stack();
         self.clear_lambdas();
 
-        let anchors = self.evaluation.anchor_order.clone();
-        let formulas = self.formula_positions();
+        let roots = match partial {
+            Some((roots, dirty)) => {
+                self.evaluation.partial = Some(dirty);
+                roots
+            }
+            None => {
+                self.evaluation.partial = None;
+                // dynamic links (HYPERLINK) are rebuilt on every evaluation;
+                // a formula that runs drops its own first (`run_top`)
+                self.links.clear();
+                let mut roots = self.evaluation.anchor_order.clone();
+                roots.extend(self.formula_positions());
+                roots
+            }
+        };
         let mut restart = None;
-        for cell in anchors.into_iter().chain(formulas) {
+        for cell in roots {
             self.evaluation.root = Some(cell);
             self.evaluate_cell(cell);
             if self.evaluation.restart.is_some() {
@@ -714,6 +1044,8 @@ impl<'a> Model<'a> {
         }
         self.evaluation.in_pass = false;
         self.evaluation.root = None;
+        // The indexes hold what the cells held during the pass.
+        self.evaluation.lookup_indexes.clear();
         restart
     }
 
@@ -780,7 +1112,7 @@ impl<'a> Model<'a> {
             self.record_seen(cell_reference, Seen::Empty);
             return CalcResult::EmptyCell;
         };
-        let anchor_state = self.evaluation.cells.get(&key(anchor_reference)).copied();
+        let anchor_state = self.pass_state(key(anchor_reference));
         match (kind, anchor_state) {
             // Written by the anchor in this pass.
             (_, Some(CellState::Evaluated)) => self.stored_value(cell_reference),
@@ -826,7 +1158,7 @@ impl<'a> Model<'a> {
         cell: FormulaCell,
     ) -> CalcResult {
         let key = key(cell_reference);
-        match self.evaluation.cells.get(&key) {
+        match self.pass_state(key) {
             Some(CellState::Evaluating) => {
                 self.mark_cycle(cell_reference);
                 return circular_reference(cell_reference);
@@ -989,6 +1321,18 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// The state of a formula cell in the current pass. A formula that a
+    /// partial pass leaves out counts as evaluated: it holds its value.
+    fn pass_state(&self, position: CellKey) -> Option<CellState> {
+        match self.evaluation.cells.get(&position) {
+            Some(state) => Some(*state),
+            None => match &self.evaluation.partial {
+                Some(dirty) if !dirty.contains(&position) => Some(CellState::Evaluated),
+                _ => None,
+            },
+        }
+    }
+
     /// The value currently stored at a position, empty if there is no cell.
     fn stored_value(&self, cell_reference: CellReferenceIndex) -> CalcResult {
         match self.fetch_cell(cell_reference) {
@@ -1132,6 +1476,31 @@ impl<'a> Model<'a> {
         });
         true
     }
+}
+
+/// Whether a position of `area` is in `changed`, which is sorted.
+fn written(changed: &[CellKey], area: &Rect) -> bool {
+    let start = changed.partition_point(|position| *position < (area.sheet, area.row1, 0));
+    changed[start..]
+        .iter()
+        .take_while(|position| **position <= (area.sheet, area.row2, LAST_COLUMN))
+        .any(|position| area.contains(*position))
+}
+
+/// Where dynamic arrays spill: each anchor and spill cell, without values.
+fn spill_layout(
+    spills: &[(CellReferenceIndex, Cell)],
+) -> Vec<(CellReferenceIndex, Option<(i32, i32)>)> {
+    spills
+        .iter()
+        .map(|(position, cell)| {
+            let anchor = match cell {
+                Cell::SpillCell { a, .. } => Some(*a),
+                _ => None,
+            };
+            (*position, anchor)
+        })
+        .collect()
 }
 
 fn circular_reference(cell_reference: CellReferenceIndex) -> CalcResult {

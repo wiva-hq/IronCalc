@@ -188,7 +188,8 @@ fn stale_read_at_the_bottom_of_a_deep_chain() {
         assert_eq!(model.evaluation.restarts_in_last_evaluation, 0);
 
         model._set("A1", "=SEQUENCE(1,1,D1)");
-        model.evaluate();
+        // In full: evaluating only A1 reads D1 as it is and needs no restart.
+        model.evaluate_all();
         assert_eq!(model._get_text("A1"), "3", "max_depth = {max_depth}");
         assert_eq!(
             model.evaluation.restarts_in_last_evaluation, 1,
