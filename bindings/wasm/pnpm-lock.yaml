@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      binaryen:
+        specifier: 123.0.0
+        version: 123.0.0
       typedoc:
         specifier: 0.28.20
         version: 0.28.20(typescript@6.0.3)
@@ -47,6 +50,10 @@ packages:
   balanced-match@4.0.4:
     resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
     engines: {node: 18 || 20 || >=22}
+
+  binaryen@123.0.0:
+    resolution: {integrity: sha512-/hls/a309aZCc0itqP6uhoR+5DsKSlJVfB8Opd2BY9Ndghs84IScTunlyidyF4r2Xe3lQttnfBNIDjaNpj6mTw==}
+    hasBin: true
 
   brace-expansion@5.0.9:
     resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
@@ -136,6 +143,8 @@ snapshots:
   argparse@2.0.1: {}
 
   balanced-match@4.0.4: {}
+
+  binaryen@123.0.0: {}
 
   brace-expansion@5.0.9:
     dependencies:
